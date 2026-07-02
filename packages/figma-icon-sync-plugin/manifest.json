@@ -1,0 +1,13 @@
+{
+  "name": "Frosted UI — Icon Sync",
+  "id": "frosted-ui-icon-sync",
+  "api": "1.0.0",
+  "main": "dist/code.js",
+  "ui": "dist/ui.html",
+  "editorType": ["figma"],
+  "documentAccess": "dynamic-page",
+  "networkAccess": {
+    "allowedDomains": ["https://cdn.jsdelivr.net", "https://data.jsdelivr.com"],
+    "reasoning": "Compares the Figma icons against the latest published @frosted-ui/icons manifest."
+  }
+}
