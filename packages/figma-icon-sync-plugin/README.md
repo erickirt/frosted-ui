@@ -1,5 +1,7 @@
 # Frosted UI — Icon Sync (Figma plugin)
 
+<img width="1151" height="793" alt="Screenshot 2026-07-02 at 18 03 33" src="https://github.com/user-attachments/assets/3b1d17c6-3bf0-4078-ae93-6d98993d2ccf" />
+
 A Figma plugin that inspects the **Icons** page of the [Frosted Design System file](https://www.figma.com/design/pWs6edprYZNR54ZPwk0oRV/), verifies icon naming/size conventions, and — once everything passes — sends you to GitHub to run the sync.
 
 > **How the sync works (no tokens):** the plugin never holds a credential. When validation passes it enables an **Open sync on GitHub** button that opens the [`Sync Icons from Figma`](../../.github/workflows/sync-icons.yml) workflow page in your browser, where you press GitHub's own **Run workflow** button. Auth and "who's allowed" are handled entirely by GitHub's login and repo permissions.
