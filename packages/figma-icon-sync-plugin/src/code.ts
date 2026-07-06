@@ -6,8 +6,7 @@ const ALLOWED_SIZES = [12, 16, 20, 24, 32];
 // The Actions page for the icon-sync workflow. Opening it lets a designer press
 // GitHub's own "Run workflow" button — no token needed, gated by GitHub's own
 // repo permissions.
-const SYNC_WORKFLOW_URL =
-  'https://github.com/whopio/frosted-ui/actions/workflows/sync-icons.yml';
+const SYNC_WORKFLOW_URL = 'https://github.com/whopio/frosted-ui/actions/workflows/sync-icons.yml';
 
 type Severity = 'error' | 'warning';
 
@@ -85,9 +84,7 @@ function svgDrawsFillAndStroke(svg: string): boolean {
     const strokeStyle = /(?:^|;)\s*stroke\s*:\s*([^;]+)/i.exec(styleText);
 
     const fillVal = (fillAttr ? fillAttr[1] : fillStyle ? fillStyle[1] : '').trim().toLowerCase();
-    const strokeVal = (strokeAttr ? strokeAttr[1] : strokeStyle ? strokeStyle[1] : '')
-      .trim()
-      .toLowerCase();
+    const strokeVal = (strokeAttr ? strokeAttr[1] : strokeStyle ? strokeStyle[1] : '').trim().toLowerCase();
 
     // A shape is filled only with an explicit non-"none" fill (the root <svg>
     // sets fill="none", so unset means not filled).
@@ -127,22 +124,64 @@ function hasHiddenDescendant(node: SceneNode): boolean {
   return false;
 }
 
-// The rendered content should be exactly one shape. We only count visible
-// children (hidden layers are caught separately) — so a lone vector or a single
-// union passes, while multiple shapes or a group/frame wrapper does not.
+// Container/wrapper nodes that shouldn't live inside a clean icon — the final
+// artwork should be flat vectors/booleans, never nested frames, groups, or
+// instances. (BOOLEAN_OPERATION is intentionally excluded: it's the flattening
+// op whose direct children are vectors.)
+function isContainerType(type: string): boolean {
+  return (
+    type === 'FRAME' ||
+    type === 'GROUP' ||
+    type === 'SECTION' ||
+    type === 'COMPONENT' ||
+    type === 'COMPONENT_SET' ||
+    type === 'INSTANCE'
+  );
+}
+
+// True if any visible descendant is a frame/group/instance wrapper — i.e. the
+// icon has nested "mess" instead of being a single flattened shape.
+function hasNestedContainer(node: SceneNode): boolean {
+  if (!('children' in node)) return false;
+  for (const child of node.children) {
+    if (child.visible === false) continue;
+    if (isContainerType(child.type)) return true;
+    if (hasNestedContainer(child)) return true;
+  }
+  return false;
+}
+
+// The rendered content should be exactly one flattened shape. We only count
+// visible children (hidden layers are caught separately) — so a lone vector or
+// a single union passes, while multiple shapes, a group/frame wrapper, or any
+// nested frame/group buried inside the shape does not.
 function isSingleShape(variant: ComponentNode): boolean {
   const visible = variant.children.filter((c) => c.visible !== false);
   if (visible.length !== 1) return false;
-  return isShapeType(visible[0].type);
+  if (!isShapeType(visible[0].type)) return false;
+  if (hasNestedContainer(visible[0])) return false;
+  return true;
+}
+
+// Icon shapes must use horizontal + vertical "Scale" constraints so they resize
+// with the frame. Checks every visible layer in the subtree (nested vectors
+// inside a boolean op / group also need Scale, not just the top-level layer).
+function hasNonScaleConstraints(node: SceneNode & ChildrenMixin): boolean {
+  for (const child of node.children) {
+    if (child.visible === false) continue;
+    if ('constraints' in child) {
+      const con = (child as SceneNode & { constraints: Constraints }).constraints;
+      if (con.horizontal !== 'SCALE' || con.vertical !== 'SCALE') return true;
+    }
+    if ('children' in child && hasNonScaleConstraints(child as SceneNode & ChildrenMixin)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // Builds a per-icon warning whose detail pills jump to each affected size.
-function sizeScopedIssue(
-  rule: string,
-  name: string,
-  verb: string,
-  entries: { nodeId: string; size: number }[],
-): Issue {
+function sizeScopedIssue(rule: string, name: string, verb: string, entries: { nodeId: string; size: number }[]): Issue {
   const sorted = [...entries].sort(
     (a, b) => (Number.isNaN(a.size) ? Infinity : a.size) - (Number.isNaN(b.size) ? Infinity : b.size),
   );
@@ -269,6 +308,7 @@ async function scan(): Promise<{
       const sizeCounts = new Map<number, number>();
       const hiddenAt: { nodeId: string; size: number }[] = [];
       const notSingleAt: { nodeId: string; size: number }[] = [];
+      const badConstraintsAt: { nodeId: string; size: number }[] = [];
 
       for (const variant of variants) {
         variantCount += 1;
@@ -278,6 +318,7 @@ async function scan(): Promise<{
         const structSize = sizeGuess ? Number(sizeGuess[1]) : Number.NaN;
         if (hasHiddenDescendant(variant)) hiddenAt.push({ nodeId: variant.id, size: structSize });
         if (!isSingleShape(variant)) notSingleAt.push({ nodeId: variant.id, size: structSize });
+        if (hasNonScaleConstraints(variant)) badConstraintsAt.push({ nodeId: variant.id, size: structSize });
 
         // The variant name must be *exactly* `size=<number>`. An unanchored
         // match would wrongly accept mislabelled properties whose name merely
@@ -351,9 +392,13 @@ async function scan(): Promise<{
       // Rule: the icon should be a single final shape (a vector or union), not
       // multiple layers or a group/frame wrapper.
       if (notSingleAt.length > 0) {
-        issues.push(
-          sizeScopedIssue('not-single-shape', name, "isn't a single flattened shape", notSingleAt),
-        );
+        issues.push(sizeScopedIssue('not-single-shape', name, "isn't a single flattened shape", notSingleAt));
+      }
+
+      // Rule: the icon shape must use Scale/Scale constraints so it resizes with
+      // the frame.
+      if (badConstraintsAt.length > 0) {
+        issues.push(sizeScopedIssue('bad-constraints', name, "isn't set to Scale", badConstraintsAt));
       }
     }
   }
@@ -633,9 +678,7 @@ figma.ui.onmessage = async (msg: { type: string; id?: string; width?: number; he
 (async () => {
   // Restore the designer's preferred window size before scanning.
   try {
-    const saved = (await figma.clientStorage.getAsync(SIZE_KEY)) as
-      | { width?: number; height?: number }
-      | undefined;
+    const saved = (await figma.clientStorage.getAsync(SIZE_KEY)) as { width?: number; height?: number } | undefined;
     if (saved && saved.width && saved.height) {
       figma.ui.resize(
         clamp(saved.width, MIN_SIZE.width, MAX_SIZE.width),

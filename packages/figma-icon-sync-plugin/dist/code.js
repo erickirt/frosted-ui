@@ -49,10 +49,37 @@
     }
     return false;
   }
+  function isContainerType(type) {
+    return type === "FRAME" || type === "GROUP" || type === "SECTION" || type === "COMPONENT" || type === "COMPONENT_SET" || type === "INSTANCE";
+  }
+  function hasNestedContainer(node) {
+    if (!("children" in node)) return false;
+    for (const child of node.children) {
+      if (child.visible === false) continue;
+      if (isContainerType(child.type)) return true;
+      if (hasNestedContainer(child)) return true;
+    }
+    return false;
+  }
   function isSingleShape(variant) {
     const visible = variant.children.filter((c) => c.visible !== false);
     if (visible.length !== 1) return false;
-    return isShapeType(visible[0].type);
+    if (!isShapeType(visible[0].type)) return false;
+    if (hasNestedContainer(visible[0])) return false;
+    return true;
+  }
+  function hasNonScaleConstraints(node) {
+    for (const child of node.children) {
+      if (child.visible === false) continue;
+      if ("constraints" in child) {
+        const con = child.constraints;
+        if (con.horizontal !== "SCALE" || con.vertical !== "SCALE") return true;
+      }
+      if ("children" in child && hasNonScaleConstraints(child)) {
+        return true;
+      }
+    }
+    return false;
   }
   function sizeScopedIssue(rule, name, verb, entries) {
     const sorted = [...entries].sort(
@@ -142,12 +169,14 @@
         const sizeCounts = /* @__PURE__ */ new Map();
         const hiddenAt = [];
         const notSingleAt = [];
+        const badConstraintsAt = [];
         for (const variant of variants) {
           variantCount += 1;
           const sizeGuess = /size=(\d+)/i.exec(variant.name);
           const structSize = sizeGuess ? Number(sizeGuess[1]) : Number.NaN;
           if (hasHiddenDescendant(variant)) hiddenAt.push({ nodeId: variant.id, size: structSize });
           if (!isSingleShape(variant)) notSingleAt.push({ nodeId: variant.id, size: structSize });
+          if (hasNonScaleConstraints(variant)) badConstraintsAt.push({ nodeId: variant.id, size: structSize });
           const match = /^size=(\d+)$/i.exec(variant.name.trim());
           if (!match) {
             issues.push({
@@ -202,9 +231,10 @@
           issues.push(sizeScopedIssue("hidden-layers", name, "has hidden layers", hiddenAt));
         }
         if (notSingleAt.length > 0) {
-          issues.push(
-            sizeScopedIssue("not-single-shape", name, "isn't a single flattened shape", notSingleAt)
-          );
+          issues.push(sizeScopedIssue("not-single-shape", name, "isn't a single flattened shape", notSingleAt));
+        }
+        if (badConstraintsAt.length > 0) {
+          issues.push(sizeScopedIssue("bad-constraints", name, "isn't set to Scale", badConstraintsAt));
         }
       }
     }
