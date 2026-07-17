@@ -2,7 +2,10 @@
 (() => {
   // src/code.ts
   var ALLOWED_SIZES = [12, 16, 20, 24, 32];
+  var PICTOGRAM_BACKGROUNDS = ["light", "dark", "orange"];
+  var PICTOGRAM_DIMENSION = 240;
   var SYNC_WORKFLOW_URL = "https://github.com/whopio/frosted-ui/actions/workflows/sync-icons.yml";
+  var PICTOGRAM_SYNC_WORKFLOW_URL = "https://github.com/whopio/frosted-ui/actions/workflows/sync-pictograms.yml";
   function normalize(name) {
     return name.replace(/[^a-z0-9]/gi, "").toLowerCase();
   }
@@ -90,6 +93,11 @@
     if (!isShapeType(visible[0].type)) return false;
     if (hasNestedContainer(visible[0])) return false;
     return true;
+  }
+  function isSinglePictogramLayer(comp) {
+    if (hasHiddenDescendant(comp)) return false;
+    const visible = comp.children.filter((c) => c.visible !== false);
+    return visible.length === 1;
   }
   function hasNonScaleConstraints(node) {
     for (const child of node.children) {
@@ -321,6 +329,7 @@
     const errorCount = issues.filter((i) => i.severity === "error").length;
     const warningCount = issues.length - errorCount;
     const result = {
+      kind: "icons",
       pageName: page.name,
       usedFallbackPage: usedFallback,
       iconCount,
@@ -334,10 +343,296 @@
     };
     return { result, baseNames, qualityTargets, previewByNode };
   }
+  function parseVariantProps(name) {
+    const out = {};
+    for (const part of name.split(",")) {
+      const idx = part.indexOf("=");
+      if (idx === -1) continue;
+      const key = part.slice(0, idx).trim().toLowerCase();
+      const value = part.slice(idx + 1).trim();
+      if (key) out[key] = value;
+    }
+    return out;
+  }
+  function isPictogramContainer(node) {
+    const isContainerType2 = node.type === "COMPONENT_SET" || node.type === "FRAME" || node.type === "GROUP";
+    return isContainerType2 && /^pictograms?$/i.test(node.name.trim());
+  }
+  function findPictogramsPage() {
+    const byName = figma.root.children.find((p) => normalize(p.name) === "pictograms");
+    if (byName) return { page: byName, usedFallback: false };
+    for (const p of figma.root.children) {
+      const found = p.findOne((n) => isPictogramContainer(n));
+      if (found) return { page: p, usedFallback: true };
+    }
+    return { page: figma.currentPage, usedFallback: true };
+  }
+  function capitalize(s) {
+    return s ? s.charAt(0).toUpperCase() + s.slice(1) : s;
+  }
+  async function scanPictograms() {
+    await figma.loadAllPagesAsync();
+    const { page, usedFallback } = findPictogramsPage();
+    const issues = [];
+    const previewByNode = /* @__PURE__ */ new Map();
+    const baseNames = /* @__PURE__ */ new Map();
+    const containers = page.findAll((n) => isPictogramContainer(n));
+    const insideIds = /* @__PURE__ */ new Set();
+    const components = [];
+    for (const container of containers) {
+      if (!("findAll" in container)) continue;
+      const comps = container.findAll((n) => n.type === "COMPONENT");
+      for (const comp of comps) {
+        if (!insideIds.has(comp.id)) {
+          insideIds.add(comp.id);
+          components.push(comp);
+        }
+      }
+    }
+    const families = /* @__PURE__ */ new Map();
+    const seenVariants = /* @__PURE__ */ new Set();
+    const backgroundsSeen = /* @__PURE__ */ new Set();
+    const compFamilyKey = [];
+    let variantCount = 0;
+    for (const comp of components) {
+      const props = parseVariantProps(comp.name);
+      const pictogram = (props.pictogram || "").trim();
+      const background = (props.background || "").trim();
+      if (!pictogram || !background) {
+        issues.push({
+          severity: "error",
+          rule: "pictogram-empty-name",
+          message: `A pictogram variant is named "${comp.name}" (expected "pictogram=Name, background=Light|Dark|Orange").`,
+          nodeId: comp.id
+        });
+        continue;
+      }
+      variantCount += 1;
+      const bgLower = background.toLowerCase();
+      backgroundsSeen.add(bgLower);
+      if (/\d/.test(pictogram)) {
+        issues.push({
+          severity: "error",
+          rule: "pictogram-number-in-name",
+          message: `"${pictogram}" has a number in its name (numbers aren't allowed).`,
+          nodeId: comp.id
+        });
+      }
+      if (!PICTOGRAM_BACKGROUNDS.includes(bgLower)) {
+        issues.push({
+          severity: "error",
+          rule: "pictogram-invalid-background",
+          message: `"${pictogram}" has background "${background}" (allowed: Light, Dark, Orange).`,
+          nodeId: comp.id
+        });
+      }
+      const w = Math.round(comp.width);
+      const h = Math.round(comp.height);
+      if (w !== PICTOGRAM_DIMENSION || h !== PICTOGRAM_DIMENSION) {
+        issues.push({
+          severity: "warning",
+          rule: "pictogram-dimension",
+          message: `"${pictogram}" ${background} is ${w}\xD7${h} (expected ${PICTOGRAM_DIMENSION}\xD7${PICTOGRAM_DIMENSION}).`,
+          nodeId: comp.id
+        });
+      }
+      const famKey = normalize(pictogram);
+      let fam = families.get(famKey);
+      if (!fam) {
+        fam = {
+          display: pictogram,
+          backgrounds: /* @__PURE__ */ new Set(),
+          repId: comp.id,
+          previewId: comp.id,
+          variants: [],
+          badConstraints: [],
+          notSingle: []
+        };
+        families.set(famKey, fam);
+      }
+      fam.backgrounds.add(bgLower);
+      if (bgLower === "light") {
+        fam.repId = comp.id;
+        fam.previewId = comp.id;
+        fam.display = pictogram;
+      }
+      const dupKey = `${famKey}|${bgLower}`;
+      if (seenVariants.has(dupKey)) {
+        issues.push({
+          severity: "error",
+          rule: "pictogram-duplicate",
+          message: `"${pictogram}" has multiple "${background}" variants.`,
+          nodeId: comp.id
+        });
+      } else {
+        seenVariants.add(dupKey);
+        if (PICTOGRAM_BACKGROUNDS.includes(bgLower)) {
+          fam.variants.push({ bg: bgLower, node: comp });
+          if (hasNonScaleConstraints(comp)) fam.badConstraints.push({ bg: bgLower, nodeId: comp.id });
+          if (!isSinglePictogramLayer(comp)) fam.notSingle.push({ bg: bgLower, nodeId: comp.id });
+        }
+      }
+      compFamilyKey.push({ compId: comp.id, famKey });
+    }
+    for (const { compId, famKey } of compFamilyKey) {
+      const fam = families.get(famKey);
+      if (fam) previewByNode.set(compId, fam.previewId);
+    }
+    for (const fam of families.values()) {
+      const base = kebab(fam.display);
+      if (base && !baseNames.has(base)) baseNames.set(base, fam.repId);
+    }
+    for (const fam of families.values()) {
+      const missing = PICTOGRAM_BACKGROUNDS.filter((b) => !fam.backgrounds.has(b));
+      if (missing.length > 0) {
+        issues.push({
+          severity: "warning",
+          rule: "pictogram-incomplete-backgrounds",
+          message: `"${fam.display}" is missing ${missing.map(capitalize).join(", ")}.`,
+          nodeId: fam.repId
+        });
+      }
+    }
+    for (const fam of families.values()) {
+      if (fam.badConstraints.length === 0) continue;
+      const sorted = [...fam.badConstraints].sort(
+        (a, b) => PICTOGRAM_BACKGROUNDS.indexOf(a.bg) - PICTOGRAM_BACKGROUNDS.indexOf(b.bg)
+      );
+      issues.push({
+        severity: "error",
+        rule: "pictogram-bad-constraints",
+        message: `"${fam.display}" isn't set to Scale:`,
+        nodeId: fam.repId,
+        targets: sorted.map((b) => ({ nodeId: b.nodeId, label: capitalize(b.bg) }))
+      });
+    }
+    for (const fam of families.values()) {
+      if (fam.notSingle.length === 0) continue;
+      const sorted = [...fam.notSingle].sort(
+        (a, b) => PICTOGRAM_BACKGROUNDS.indexOf(a.bg) - PICTOGRAM_BACKGROUNDS.indexOf(b.bg)
+      );
+      issues.push({
+        severity: "error",
+        rule: "pictogram-not-single-layer",
+        message: `"${fam.display}" isn't a single layer:`,
+        nodeId: fam.repId,
+        targets: sorted.map((b) => ({ nodeId: b.nodeId, label: capitalize(b.bg) }))
+      });
+    }
+    const allComponents = page.findAllWithCriteria({ types: ["COMPONENT"] });
+    const orphans = allComponents.filter((c) => {
+      if (insideIds.has(c.id)) return false;
+      const props = parseVariantProps(c.name);
+      return !!props.pictogram && !!props.background;
+    });
+    if (orphans.length > 0) {
+      issues.push({
+        severity: "warning",
+        rule: "pictogram-orphan",
+        message: `${orphans.length} pictogram component${orphans.length === 1 ? "" : "s"} are not inside a "Pictogram" container and will be skipped.`,
+        nodeId: orphans[0].id
+      });
+    }
+    for (const issue of issues) {
+      const rep = issue.nodeId || issue.targets && issue.targets[0] && issue.targets[0].nodeId;
+      if (rep) {
+        const preview = previewByNode.get(rep);
+        if (preview) issue.previewId = preview;
+      }
+    }
+    const shapeTargets = [];
+    for (const fam of families.values()) {
+      if (fam.variants.length >= 2) {
+        shapeTargets.push({ name: fam.display, previewId: fam.previewId, variants: fam.variants });
+      }
+    }
+    issues.sort((a, b) => a.severity === b.severity ? 0 : a.severity === "error" ? -1 : 1);
+    const errorCount = issues.filter((i) => i.severity === "error").length;
+    const warningCount = issues.length - errorCount;
+    const result = {
+      kind: "pictograms",
+      pageName: page.name,
+      usedFallbackPage: usedFallback,
+      iconCount: families.size,
+      variantCount,
+      categoryCount: backgroundsSeen.size,
+      orphanCount: orphans.length,
+      passed: families.size > 0 && errorCount === 0,
+      errorCount,
+      warningCount,
+      issues
+    };
+    return { result, baseNames, previewByNode, shapeTargets };
+  }
+  var PICTOGRAM_SHAPE_TAGS = ["path", "circle", "rect", "ellipse", "polygon", "polyline", "line"];
+  var PICTOGRAM_GEOM_ATTRS = ["d", "points", "x", "y", "width", "height", "cx", "cy", "r", "rx", "ry", "transform"];
+  function normalizeGeometry(value) {
+    return value.replace(/-?\d*\.?\d+(?:e-?\d+)?/gi, (m) => String(Math.round(parseFloat(m))));
+  }
+  function pictogramShapeSignature(svg) {
+    const body = svg.replace(/<defs[\s\S]*?<\/defs>/gi, "");
+    const re = new RegExp(`<(${PICTOGRAM_SHAPE_TAGS.join("|")})\\b([^>]*?)\\/?>`, "gi");
+    const sigs = [];
+    let m;
+    while ((m = re.exec(body)) !== null) {
+      const tag = m[1].toLowerCase();
+      const attrs = m[2];
+      const parts = [tag];
+      for (const attr of PICTOGRAM_GEOM_ATTRS) {
+        const am = new RegExp(`${attr}\\s*=\\s*"([^"]*)"`, "i").exec(attrs);
+        parts.push(`${attr}=${am ? normalizeGeometry(am[1]) : ""}`);
+      }
+      sigs.push(parts.join("|"));
+    }
+    return sigs;
+  }
+  function sameSignature(a, b) {
+    if (a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
+    return true;
+  }
+  async function runPictogramShapeChecks(targets) {
+    const issues = [];
+    const BATCH = 8;
+    for (let i = 0; i < targets.length; i += BATCH) {
+      const slice = targets.slice(i, i + BATCH);
+      const results = await Promise.all(
+        slice.map(async (t) => {
+          try {
+            const sigs = await Promise.all(
+              t.variants.map(async (v) => ({
+                bg: v.bg,
+                nodeId: v.node.id,
+                sig: pictogramShapeSignature(bytesToString(await v.node.exportAsync({ format: "SVG" })))
+              }))
+            );
+            const ref = sigs.find((s) => s.bg === "light") || sigs[0];
+            const differing = sigs.filter((s) => s !== ref && !sameSignature(s.sig, ref.sig));
+            if (differing.length === 0) return null;
+            return { target: t, refBg: ref.bg, differing };
+          } catch {
+            return null;
+          }
+        })
+      );
+      for (const r of results) {
+        if (!r) continue;
+        const labels = r.differing.map((d) => capitalize(d.bg)).join(", ");
+        issues.push({
+          severity: "error",
+          rule: "pictogram-mismatched-shapes",
+          message: `"${r.target.name}": ${labels} ${r.differing.length === 1 ? "differs" : "differ"} from ${capitalize(r.refBg)}.`,
+          previewId: r.target.previewId,
+          targets: r.differing.map((d) => ({ nodeId: d.nodeId, label: capitalize(d.bg) }))
+        });
+      }
+    }
+    return issues;
+  }
   function toCurrentColor(svg) {
     return svg.replace(/\b(fill|stroke)\s*=\s*"(?!none")[^"]*"/gi, '$1="currentColor"');
   }
-  async function buildPreviews(ids) {
+  async function buildPreviews(ids, recolor) {
     const map = {};
     const BATCH = 20;
     for (let i = 0; i < ids.length; i += BATCH) {
@@ -348,7 +643,8 @@
             const node = await figma.getNodeByIdAsync(id);
             if (node && !node.removed && "exportAsync" in node) {
               const bytes = await node.exportAsync({ format: "SVG" });
-              map[id] = toCurrentColor(bytesToString(bytes));
+              const svg = bytesToString(bytes);
+              map[id] = recolor ? toCurrentColor(svg) : svg;
             }
           } catch {
           }
@@ -393,8 +689,10 @@
     }
     return issues;
   }
-  async function fetchReleaseDiff(current) {
+  async function fetchReleaseDiff(current, kind) {
     const empty = { comparedToVersion: null, error: null, added: [], removed: [] };
+    const manifestFile = kind === "pictograms" ? "pictograms-manifest.json" : "manifest.json";
+    const toBase = (svgName) => kind === "pictograms" ? svgName.replace(/-(light|dark|orange)-pictogram$/i, "") : svgName.replace(/-\d+$/, "");
     try {
       let version = null;
       try {
@@ -405,7 +703,7 @@
         }
       } catch {
       }
-      const url = version ? `https://cdn.jsdelivr.net/npm/@frosted-ui/icons@${version}/manifest.json` : "https://cdn.jsdelivr.net/npm/@frosted-ui/icons/manifest.json";
+      const url = version ? `https://cdn.jsdelivr.net/npm/@frosted-ui/icons@${version}/${manifestFile}` : `https://cdn.jsdelivr.net/npm/@frosted-ui/icons/${manifestFile}`;
       const res = await fetch(url);
       if (!res.ok) {
         return { ...empty, comparedToVersion: version, error: `Could not load published manifest (${res.status}).` };
@@ -416,7 +714,7 @@
         const sizes = manifest[type];
         for (const size of Object.keys(sizes)) {
           for (const svgName of Object.keys(sizes[size])) {
-            published.add(svgName.replace(/-\d+$/, ""));
+            published.add(toBase(svgName));
           }
         }
       }
@@ -457,10 +755,10 @@
   function clamp(value, min, max) {
     return Math.max(min, Math.min(max, Math.round(value)));
   }
-  async function scanAndDiff() {
+  async function scanIconsFlow() {
     const { result, baseNames, qualityTargets, previewByNode } = await scan();
-    figma.ui.postMessage({ type: "scan-result", result });
-    figma.ui.postMessage({ type: "quality-loading" });
+    figma.ui.postMessage({ type: "scan-result", kind: "icons", result });
+    figma.ui.postMessage({ type: "quality-loading", kind: "icons" });
     const qualityIssues = await runQualityChecks(qualityTargets);
     for (const issue of qualityIssues) {
       const rep = issue.targets && issue.targets[0] && issue.targets[0].nodeId || issue.nodeId;
@@ -469,22 +767,44 @@
         if (preview) issue.previewId = preview;
       }
     }
-    figma.ui.postMessage({ type: "quality-result", issues: qualityIssues });
+    figma.ui.postMessage({ type: "quality-result", kind: "icons", issues: qualityIssues });
     const previewIds = /* @__PURE__ */ new Set();
     for (const issue of result.issues) if (issue.previewId) previewIds.add(issue.previewId);
     for (const issue of qualityIssues) if (issue.previewId) previewIds.add(issue.previewId);
     if (previewIds.size > 0) {
-      const previews = await buildPreviews([...previewIds]);
-      figma.ui.postMessage({ type: "previews", previews });
+      const previews = await buildPreviews([...previewIds], true);
+      figma.ui.postMessage({ type: "previews", kind: "icons", previews });
     }
-    figma.ui.postMessage({ type: "diff-loading" });
-    const diff = await fetchReleaseDiff(baseNames);
-    figma.ui.postMessage({ type: "diff-result", diff });
+    figma.ui.postMessage({ type: "diff-loading", kind: "icons" });
+    const diff = await fetchReleaseDiff(baseNames, "icons");
+    figma.ui.postMessage({ type: "diff-result", kind: "icons", diff });
+  }
+  async function scanPictogramsFlow() {
+    const { result, baseNames, shapeTargets } = await scanPictograms();
+    figma.ui.postMessage({ type: "scan-result", kind: "pictograms", result });
+    figma.ui.postMessage({ type: "quality-loading", kind: "pictograms" });
+    const shapeIssues = await runPictogramShapeChecks(shapeTargets);
+    figma.ui.postMessage({ type: "quality-result", kind: "pictograms", issues: shapeIssues });
+    const previewIds = /* @__PURE__ */ new Set();
+    for (const issue of result.issues) if (issue.previewId) previewIds.add(issue.previewId);
+    for (const issue of shapeIssues) if (issue.previewId) previewIds.add(issue.previewId);
+    if (previewIds.size > 0) {
+      const previews = await buildPreviews([...previewIds], false);
+      figma.ui.postMessage({ type: "previews", kind: "pictograms", previews });
+    }
+    figma.ui.postMessage({ type: "diff-loading", kind: "pictograms" });
+    const diff = await fetchReleaseDiff(baseNames, "pictograms");
+    figma.ui.postMessage({ type: "diff-result", kind: "pictograms", diff });
+  }
+  async function scanAll() {
+    await figma.loadAllPagesAsync();
+    await scanIconsFlow();
+    await scanPictogramsFlow();
   }
   figma.ui.onmessage = async (msg) => {
     switch (msg.type) {
       case "rescan": {
-        await scanAndDiff();
+        await scanAll();
         break;
       }
       case "focus": {
@@ -492,7 +812,7 @@
         break;
       }
       case "open-sync": {
-        figma.openExternal(SYNC_WORKFLOW_URL);
+        figma.openExternal(msg.kind === "pictograms" ? PICTOGRAM_SYNC_WORKFLOW_URL : SYNC_WORKFLOW_URL);
         break;
       }
       case "resize": {
@@ -519,6 +839,6 @@
       }
     } catch {
     }
-    await scanAndDiff();
+    await scanAll();
   })();
 })();
